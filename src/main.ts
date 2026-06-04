@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { app, dialog, ipcMain, clipboard } from 'electron';
+import { app, dialog, ipcMain, clipboard, nativeTheme } from 'electron';
 import { startServer, ensureSessionToken, getUnifiedApiKey } from './server.mjs';
 import { loadConfig, saveConfig } from './config.js';
 import { buildTray } from './tray.js';
@@ -20,6 +20,15 @@ if (!app.requestSingleInstanceLock()) {
 } else {
   let resolvedPort = DEFAULT_PORT;
   let sessionToken = '';
+  // The dashboard owns the theme (its navbar toggle); the popover and the
+  // window vibrancy follow. Last choice persists in config; before the
+  // dashboard has ever reported, fall back to the system appearance —
+  // matching the dashboard's own prefers-color-scheme default.
+  let theme: 'dark' | 'light' =
+    (process.env.FREEAPI_THEME as 'dark' | 'light' | undefined) // dev-only screenshot override
+    ?? loadConfig().theme
+    ?? (nativeTheme.shouldUseDarkColors ? 'dark' : 'light');
+  nativeTheme.themeSource = theme;
 
   app.on('second-instance', () => {
     if (sessionToken) openDashboard(resolvedPort, sessionToken);
@@ -39,7 +48,18 @@ if (!app.requestSingleInstanceLock()) {
       successRate: successRateToday(),
       hourly: hourlyRequests(),
       loginItem: app.getLoginItemSettings().openAtLogin,
+      theme,
     };
+  });
+  ipcMain.on('freeapi:theme-changed', async (_e, next: 'dark' | 'light') => {
+    if (next !== 'dark' && next !== 'light') return;
+    if (next === theme) return;
+    theme = next;
+    saveConfig({ ...loadConfig(), theme });
+    // Flips the vibrancy materials (popover glass + dashboard backdrop).
+    nativeTheme.themeSource = theme;
+    const { getPopoverWindow } = await import('./popover.js');
+    getPopoverWindow()?.webContents.send('freeapi:refresh');
   });
   ipcMain.handle('freeapi:open-dashboard', () => openDashboard(resolvedPort, sessionToken));
   ipcMain.handle('freeapi:copy-base-url', () => clipboard.writeText(`http://127.0.0.1:${resolvedPort}/v1`));
@@ -88,6 +108,19 @@ if (!app.requestSingleInstanceLock()) {
           const pop = getPopoverWindow();
           pop?.removeAllListeners('blur'); // stay open unfocused
           if (pop) fs.writeFileSync('/tmp/freeapi-popover-bounds.json', JSON.stringify(pop.getBounds()));
+          // FREEAPI_THEME forces a theme for captures — skip the dashboard
+          // then, or its theme report would immediately override the override.
+          if (!process.env.FREEAPI_THEME) {
+            openDashboard(port, sessionToken);
+            await sleep(2500);
+            const dashWin = getDashboardWindow();
+            if (dashWin) {
+              dashWin.show();
+              dashWin.focus();
+              dashWin.moveTop();
+              fs.writeFileSync('/tmp/freeapi-dashboard-bounds.json', JSON.stringify(dashWin.getBounds()));
+            }
+          }
           return;
         }
         await sleep(1500);

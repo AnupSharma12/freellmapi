@@ -28,11 +28,19 @@ export function openDashboard(port: number, token: string): void {
     minHeight: 480,
     title: 'FreeLLMAPI',
     // Native feel: traffic lights float over the app's own header (the client
-    // adds a drag region + left padding when it detects the desktop shell).
+    // adds a drag region + left padding when it detects the desktop shell),
+    // and the window carries an under-window vibrancy so the client's
+    // slightly-translucent desktop backdrop (html.desktop in index.css)
+    // picks up a hint of the same glass as the tray popover. The material
+    // follows nativeTheme.themeSource, i.e. the dashboard's own theme.
     ...(process.platform === 'darwin'
-      ? { titleBarStyle: 'hiddenInset' as const }
-      : {}),
-    backgroundColor: '#09090b',
+      ? {
+          titleBarStyle: 'hiddenInset' as const,
+          vibrancy: 'under-window' as const,
+          visualEffectState: 'followWindow' as const,
+          backgroundColor: '#00000000',
+        }
+      : { backgroundColor: '#09090b' }),
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,

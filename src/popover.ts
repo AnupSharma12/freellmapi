@@ -31,10 +31,11 @@ function createPopover(): BrowserWindow {
     alwaysOnTop: true,
     ...(process.platform === 'darwin'
       ? {
-          // 'hud' renders the DARK glass variant regardless of the system
-          // light/dark appearance — 'popover' follows the system theme and
-          // turns white under light mode, fighting the panel's light text.
-          vibrancy: 'hud' as const,
+          // 'popover' follows the app appearance, which main.ts pins via
+          // nativeTheme.themeSource to the DASHBOARD's theme choice — so the
+          // glass flips dark/light together with the dashboard. The dark
+          // variant is deepened toward black by the panel's CSS tint.
+          vibrancy: 'popover' as const,
           visualEffectState: 'active' as const,
           backgroundColor: '#00000000',
         }

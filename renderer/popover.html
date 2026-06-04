@@ -3,19 +3,46 @@
 <head>
 <meta charset="UTF-8" />
 <style>
+  /* Theme variables: dark by default (deep black glass), body.light flips
+     them. The theme is driven by the dashboard's toggle via main.ts. */
   :root {
     --fg: rgba(255, 255, 255, 0.92);
     --fg-dim: rgba(255, 255, 255, 0.55);
     --fg-faint: rgba(255, 255, 255, 0.32);
     --hairline: rgba(255, 255, 255, 0.10);
+    --card: rgba(255, 255, 255, 0.055);
+    --card-edge: rgba(255, 255, 255, 0.10);
+    --ghost: rgba(255, 255, 255, 0.08);
+    --ghost-hover: rgba(255, 255, 255, 0.13);
+    --switch-off: rgba(255, 255, 255, 0.16);
+    --sheen: rgba(255, 255, 255, 0.12);
+    --zero-bar: rgba(255, 255, 255, 0.10);
     --accent: #6aa6ff;
     --accent-2: #8e7bff;
     --ok: #34c759;
+    --panel-tint: linear-gradient(180deg, rgba(12,12,15,0.62), rgba(0,0,2,0.72));
+    --panel-solid: linear-gradient(180deg, #19191d, #0a0a0d);
+  }
+  body.light {
+    --fg: rgba(20, 20, 24, 0.92);
+    --fg-dim: rgba(20, 20, 24, 0.56);
+    --fg-faint: rgba(20, 20, 24, 0.34);
+    --hairline: rgba(0, 0, 0, 0.10);
+    --card: rgba(0, 0, 0, 0.05);
+    --card-edge: rgba(255, 255, 255, 0.45);
+    --ghost: rgba(0, 0, 0, 0.06);
+    --ghost-hover: rgba(0, 0, 0, 0.10);
+    --switch-off: rgba(0, 0, 0, 0.14);
+    --sheen: rgba(255, 255, 255, 0.55);
+    --zero-bar: rgba(0, 0, 0, 0.10);
+    --ok: #1ea83f;
+    --panel-tint: linear-gradient(180deg, rgba(255,255,255,0.38), rgba(244,244,247,0.46));
+    --panel-solid: linear-gradient(180deg, #f4f4f6, #e9e9ee);
   }
   * { margin: 0; padding: 0; box-sizing: border-box; user-select: none; }
   /* The window itself is the panel: native rounded corners + vibrancy show
      through everywhere the page stays (near-)transparent. CSS adds only a
-     whisper of tint and the gloss sheen. */
+     tint and the gloss sheen. */
   html, body { background: transparent; height: 100%; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -25,19 +52,17 @@
   .panel {
     position: relative;
     height: 100%;
-    /* Dark glass: deep tint over the hud material — blur stays visible,
-       but the panel always reads black for the light text. */
-    background: linear-gradient(180deg, rgba(22,22,26,0.50), rgba(8,8,12,0.58));
-    box-shadow: inset 0 1px 0 rgba(255,255,255,0.10);
+    background: var(--panel-tint);
+    box-shadow: inset 0 1px 0 var(--card-edge);
     overflow: hidden;
     padding: 14px 14px 12px;
   }
-  body.no-vibrancy .panel { background: linear-gradient(180deg, #2c2c31, #1d1d21); }
+  body.no-vibrancy .panel { background: var(--panel-solid); }
   /* gloss sheen */
   .panel::before {
     content: "";
     position: absolute; inset: 0 0 auto 0; height: 110px;
-    background: radial-gradient(120% 100% at 50% -20%, rgba(255,255,255,0.12), rgba(255,255,255,0) 70%);
+    background: radial-gradient(120% 100% at 50% -20%, var(--sheen), rgba(255,255,255,0) 70%);
     pointer-events: none;
   }
 
@@ -63,8 +88,8 @@
   .stat {
     flex: 1; padding: 9px 11px 8px;
     border-radius: 12px;
-    background: rgba(255,255,255,0.055);
-    box-shadow: inset 0 0.5px 0 rgba(255,255,255,0.10);
+    background: var(--card);
+    box-shadow: inset 0 0.5px 0 var(--card-edge);
   }
   .stat .v { font-size: 19px; font-weight: 650; letter-spacing: -0.3px; font-variant-numeric: tabular-nums; }
   .stat .l { font-size: 10px; color: var(--fg-dim); margin-top: 1px; text-transform: uppercase; letter-spacing: 0.5px; }
@@ -99,17 +124,17 @@
   .primary:hover { filter: brightness(1.07); }
   .ghost {
     flex: 1; padding: 8px 4px;
-    background: rgba(255,255,255,0.08);
-    box-shadow: inset 0 0.5px 0 rgba(255,255,255,0.12);
+    background: var(--ghost);
+    box-shadow: inset 0 0.5px 0 var(--card-edge);
     color: var(--fg);
   }
-  .ghost:hover { background: rgba(255,255,255,0.13); }
+  .ghost:hover { background: var(--ghost-hover); }
   .ghost.copied { color: var(--ok); }
 
   .foot { display: flex; align-items: center; font-size: 11.5px; color: var(--fg-dim); }
   .switch {
     position: relative; width: 30px; height: 18px; border-radius: 9px;
-    background: rgba(255,255,255,0.16); margin-right: 7px; flex: none;
+    background: var(--switch-off); margin-right: 7px; flex: none;
     transition: background 0.18s ease; cursor: pointer;
     box-shadow: inset 0 1px 2px rgba(0,0,0,0.25);
   }
@@ -192,13 +217,14 @@
     const bw = (cssW - gap * (n - 1)) / n;
     const max = Math.max(...hourly, 1);
     const grad = ctx.createLinearGradient(0, 0, 0, cssH);
-    grad.addColorStop(0, 'rgba(142,123,255,0.95)');
-    grad.addColorStop(1, 'rgba(106,166,255,0.55)');
+    grad.addColorStop(0, 'rgba(48,209,88,0.95)');
+    grad.addColorStop(1, 'rgba(52,199,89,0.45)');
+    const zeroBar = getComputedStyle(document.body).getPropertyValue('--zero-bar').trim();
     for (let i = 0; i < n; i++) {
       const v = hourly[i];
       const h = v === 0 ? 2 : Math.max(3, (v / max) * (cssH - 6));
       const x = i * (bw + gap), y = cssH - h;
-      ctx.fillStyle = v === 0 ? 'rgba(255,255,255,0.10)' : grad;
+      ctx.fillStyle = v === 0 ? zeroBar : grad;
       ctx.beginPath();
       ctx.roundRect(x, y, bw, h, Math.min(3, bw / 2));
       ctx.fill();
@@ -209,6 +235,7 @@
   let loginOn = false;
   async function refresh() {
     const s = await window.freeapi.snapshot();
+    document.body.classList.toggle('light', s.theme === 'light');
     $('addr').textContent = '127.0.0.1:' + s.port;
     $('reqs').textContent = fmt(s.requests);
     $('tokens').textContent = fmt(s.tokens);

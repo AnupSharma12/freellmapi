@@ -3,7 +3,7 @@
 // token into localStorage so AuthGate's very first /api/auth/status call is
 // authenticated. The token arrives via additionalArguments (process.argv),
 // which avoids templating strings into executeJavaScript.
-import { contextBridge } from 'electron';
+import { contextBridge, ipcRenderer } from 'electron';
 
 const TOKEN_KEY = 'freellmapi_dashboard_token';
 const arg = process.argv.find((a) => a.startsWith('--freeapi-token='));
@@ -18,3 +18,27 @@ if (arg) {
 // Lets the client adapt its chrome (drag region, traffic-light padding,
 // no Sign out) when running inside the desktop shell.
 contextBridge.exposeInMainWorld('__FREEAPI_DESKTOP__', true);
+
+// `desktop` class before page styles paint → the client's translucent
+// desktop backdrop applies from the first frame (window vibrancy shows
+// through, no opaque flash).
+document.documentElement.classList.add('desktop');
+
+// Mirror the dashboard's theme to the main process so the tray popover
+// matches. The dashboard expresses its theme as the `dark` class on
+// documentElement (set by the early script in index.html and toggled by
+// the navbar) — observe that class rather than reaching across worlds
+// into localStorage.
+function reportTheme() {
+  ipcRenderer.send(
+    'freeapi:theme-changed',
+    document.documentElement.classList.contains('dark') ? 'dark' : 'light',
+  );
+}
+window.addEventListener('DOMContentLoaded', () => {
+  reportTheme();
+  new MutationObserver(reportTheme).observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ['class'],
+  });
+});

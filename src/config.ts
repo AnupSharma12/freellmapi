@@ -4,6 +4,7 @@ import { app } from 'electron';
 
 export interface DesktopConfig {
   port?: number;
+  theme?: 'dark' | 'light';
 }
 
 function configPath(): string {
