@@ -1,0 +1,36 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+
+            echo "📦 Pulling latest code..."
+            cd /var/www/ai
+            git pull origin main
+
+            echo "📥 Installing dependencies..."
+            npm install --production=false
+
+            echo "🔨 Building..."
+            npm run build
+
+            echo "🔄 Restarting server..."
+            pm2 restart freellmapi || pm2 start server/dist/index.js --name freellmapi
+            pm2 save
+
+            echo "✅ Deploy complete!"
