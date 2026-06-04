@@ -18,7 +18,6 @@ jobs:
           key: ${{ secrets.key }}
           script: |
             set -e
-
             echo "📦 Pulling latest code..."
             cd /var/www/ai
             git pull origin main
@@ -31,6 +30,7 @@ jobs:
 
             echo "🔄 Restarting server..."
             pm2 restart freellmapi || pm2 start server/dist/index.js --name freellmapi
-            pm2 save
+            pm2 save || true
 
             echo "✅ Deploy complete!"
+          request_pty: true
