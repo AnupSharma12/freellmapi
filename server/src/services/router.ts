@@ -1,5 +1,5 @@
 import { getDb, getSetting, setSetting } from '../db/index.js';
-import { getProvider, resolveProvider } from '../providers/index.js';
+import { getProvider, hasProvider, resolveProvider } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
 import { canMakeRequest, canUseTokens, isOnCooldown, canUseProvider } from './ratelimit.js';
 import {
@@ -9,7 +9,16 @@ import {
 } from './scoring.js';
 import { parseBudget } from '../lib/budget.js';
 import type { BaseProvider } from '../providers/base.js';
+import type { Platform } from '@freellmapi/shared/types.js';
 import type { Database } from 'better-sqlite3';
+
+class RouteError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
 
 interface KeyRow {
   id: number;
@@ -40,6 +49,9 @@ interface ChainRow {
   supports_vision: number;
   supports_tools: number;
   context_window: number | null;
+  // Custom models bind to the api_keys row carrying their endpoint (#212);
+  // NULL for built-in platforms.
+  key_id: number | null;
 }
 
 export interface RouteResult {
@@ -76,6 +88,8 @@ export function recordRateLimitHit(modelDbId: number) {
   const existing = rateLimitPenalties.get(modelDbId);
   const now = Date.now();
   if (existing) {
+    const decaySteps = Math.floor((now - existing.lastHit) / DECAY_INTERVAL_MS);
+    existing.penalty = Math.max(0, existing.penalty - decaySteps * DECAY_AMOUNT);
     existing.count++;
     existing.lastHit = now;
     existing.penalty = Math.min(existing.penalty + PENALTY_PER_429, MAX_PENALTY);
@@ -99,25 +113,22 @@ export function recordSuccess(modelDbId: number) {
 
 /**
  * Get the current penalty for a model (with time-based decay).
+ * Pure read — does not mutate the entry; decay is applied lazily only when
+ * recording a new hit (recordRateLimitHit) so the clock isn't reset on every
+ * routing call.
  */
 function getPenalty(modelDbId: number): number {
   const entry = rateLimitPenalties.get(modelDbId);
   if (!entry) return 0;
 
-  // Apply time-based decay
-  const now = Date.now();
-  const elapsed = now - entry.lastHit;
+  const elapsed = Date.now() - entry.lastHit;
   const decaySteps = Math.floor(elapsed / DECAY_INTERVAL_MS);
-  if (decaySteps > 0) {
-    entry.penalty = Math.max(0, entry.penalty - (decaySteps * DECAY_AMOUNT));
-    entry.lastHit = now; // reset so we don't double-decay
-    if (entry.penalty === 0) {
-      rateLimitPenalties.delete(modelDbId);
-      return 0;
-    }
+  const decayed = Math.max(0, entry.penalty - decaySteps * DECAY_AMOUNT);
+  if (decayed === 0) {
+    rateLimitPenalties.delete(modelDbId);
+    return 0;
   }
-
-  return entry.penalty;
+  return decayed;
 }
 
 /**
@@ -136,7 +147,8 @@ export function getAllPenalties(): Array<{ modelDbId: number; count: number; pen
 
 // ── Routing strategy (persisted) ────────────────────────────────────────────
 const STRATEGY_KEY = 'routing_strategy';
-const VALID_STRATEGIES: RoutingStrategy[] = ['priority', 'balanced', 'smartest', 'fastest', 'reliable'];
+const CUSTOM_WEIGHTS_KEY = 'routing_custom_weights';
+const VALID_STRATEGIES: RoutingStrategy[] = ['priority', 'balanced', 'smartest', 'fastest', 'reliable', 'custom'];
 
 export function getRoutingStrategy(): RoutingStrategy {
   const raw = getSetting(STRATEGY_KEY);
@@ -152,8 +164,47 @@ export function setRoutingStrategy(strategy: RoutingStrategy): void {
   setSetting(STRATEGY_KEY, strategy);
 }
 
+// ── Custom weights (persisted) ──────────────────────────────────────────────
+// User-tuned weight vector for the 'custom' strategy. Stored normalized (sums
+// to 1) so the dashboard percentages read cleanly; combineScore would tolerate
+// any non-negative vector regardless. Falls back to the balanced preset until
+// the user has saved their own.
+export function getCustomWeights(): RoutingWeights {
+  const raw = getSetting(CUSTOM_WEIGHTS_KEY);
+  if (raw) {
+    try {
+      const w = JSON.parse(raw) as RoutingWeights;
+      if (
+        [w.reliability, w.speed, w.intelligence].every(v => Number.isFinite(v) && v >= 0) &&
+        w.reliability + w.speed + w.intelligence > 0
+      ) {
+        return { reliability: w.reliability, speed: w.speed, intelligence: w.intelligence };
+      }
+    } catch { /* corrupt setting → fall through to default */ }
+  }
+  return { ...BANDIT_PRESETS.balanced };
+}
+
+export function setCustomWeights(weights: RoutingWeights): void {
+  const { reliability, speed, intelligence } = weights;
+  if (![reliability, speed, intelligence].every(v => Number.isFinite(v) && v >= 0)) {
+    throw new Error('Custom weights must be non-negative numbers');
+  }
+  const sum = reliability + speed + intelligence;
+  if (sum <= 0) {
+    throw new Error('Custom weights must not all be zero');
+  }
+  setSetting(CUSTOM_WEIGHTS_KEY, JSON.stringify({
+    reliability: reliability / sum,
+    speed: speed / sum,
+    intelligence: intelligence / sum,
+  }));
+}
+
 function weightsFor(strategy: RoutingStrategy): RoutingWeights | null {
-  return strategy === 'priority' ? null : BANDIT_PRESETS[strategy];
+  if (strategy === 'priority') return null;
+  if (strategy === 'custom') return getCustomWeights();
+  return BANDIT_PRESETS[strategy];
 }
 
 // ── Analytics stats cache (decay-weighted) ──────────────────────────────────
@@ -344,36 +395,180 @@ function orderChain(chain: ChainRow[], strategy: RoutingStrategy): ChainRow[] {
  * @param requireVision - only consider models that accept image input (#118)
  * @param requireTools - only consider models that emit structured tool_calls
  */
-export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireVision = false, requireTools = false): RouteResult {
+export interface ResolvedChain {
+  chain: ChainRow[];
+  strategyKey: string;
+}
+
+const GLOBAL_SORT_ALIASES: Record<string, string> = {
+  smart: 'smart', smartest: 'smart', intelligence: 'smart',
+  fast: 'fast', fastest: 'fast', speed: 'fast',
+  cheap: 'cheap', cheapest: 'cheap', price: 'cheap', budget: 'cheap',
+  reliable: 'reliable', reliability: 'reliable',
+  balanced: 'balanced',
+};
+
+function getActiveChain(db: Database): ChainRow[] {
+  const activeProfileSetting = db.prepare("SELECT value FROM settings WHERE key = 'active_profile_id'").get() as { value: string } | undefined;
+  if (activeProfileSetting) {
+    const profileId = parseInt(activeProfileSetting.value, 10);
+    const chain = db.prepare(`
+      SELECT pm.model_db_id, pm.priority, pm.enabled,
+             m.platform, m.model_id, m.display_name, m.intelligence_rank,
+             m.size_label, m.monthly_token_budget,
+             m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
+             m.supports_tools, m.context_window, m.key_id
+      FROM profile_models pm
+      JOIN models m ON m.id = pm.model_db_id AND m.enabled = 1
+      WHERE pm.profile_id = ?
+      ORDER BY pm.priority ASC
+    `).all(profileId) as ChainRow[];
+    
+    if (chain.length > 0) return chain;
+  }
+
+  return db.prepare(`
+    SELECT fc.model_db_id, fc.priority, fc.enabled,
+           m.platform, m.model_id, m.display_name, m.intelligence_rank,
+           m.size_label, m.monthly_token_budget,
+           m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
+           m.supports_tools, m.context_window, m.key_id
+    FROM fallback_config fc
+    JOIN models m ON m.id = fc.model_db_id AND m.enabled = 1
+    ORDER BY fc.priority ASC
+  `).all() as ChainRow[];
+}
+
+function getChainByProfileName(db: Database, name: string): ChainRow[] | null {
+  const profile = db.prepare("SELECT id FROM profiles WHERE LOWER(name) = ?").get(name.toLowerCase()) as { id: number } | undefined;
+  if (!profile) return null;
+
+  return db.prepare(`
+    SELECT pm.model_db_id, pm.priority, pm.enabled,
+           m.platform, m.model_id, m.display_name, m.intelligence_rank,
+           m.size_label, m.monthly_token_budget,
+           m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
+           m.supports_tools, m.context_window, m.key_id
+    FROM profile_models pm
+    JOIN models m ON m.id = pm.model_db_id AND m.enabled = 1
+    WHERE pm.profile_id = ?
+    ORDER BY pm.priority ASC
+  `).all(profile.id) as ChainRow[];
+}
+
+function getChainByGlobalSort(db: Database, globalAxis: string): ChainRow[] {
+  const allEnabled = db.prepare(`
+    SELECT m.id as model_db_id, 0 as priority, 1 as enabled,
+           m.platform, m.model_id, m.display_name, m.intelligence_rank,
+           m.size_label, m.monthly_token_budget,
+           m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
+           m.supports_tools, m.context_window, m.key_id
+    FROM models m
+    WHERE m.enabled = 1
+  `).all() as ChainRow[];
+
+  const strategyMap: Record<string, RoutingStrategy> = {
+    'smart': 'smartest',
+    'fast': 'fastest',
+    'cheap': 'balanced',
+    'reliable': 'reliable',
+    'balanced': 'balanced'
+  };
+  const strat = strategyMap[globalAxis] || 'balanced';
+  
+  return orderChain(allEnabled, strat);
+}
+
+export function resolveRoutingChain(modelString: string | undefined): ResolvedChain {
+  const db = getDb();
+
+  if (!modelString || modelString.toLowerCase() === 'auto') {
+    return { chain: getActiveChain(db), strategyKey: 'auto' };
+  }
+
+  const lower = modelString.toLowerCase();
+  if (!lower.startsWith('auto:')) {
+    return { chain: getActiveChain(db), strategyKey: 'auto' };
+  }
+
+  const suffix = lower.slice('auto:'.length).trim();
+  if (!suffix) {
+    return { chain: getActiveChain(db), strategyKey: 'auto' };
+  }
+
+  const globalAxis = GLOBAL_SORT_ALIASES[suffix];
+  if (globalAxis) {
+    const chain = getChainByGlobalSort(db, globalAxis);
+    if (chain.length === 0) {
+      const err = new Error(`No enabled models available for global sort '${suffix}'`) as any;
+      err.status = 400;
+      throw err;
+    }
+    return { chain, strategyKey: `auto:${globalAxis}` };
+  }
+
+  const chain = getChainByProfileName(db, suffix);
+  if (!chain) {
+    const err = new Error(`Profile '${suffix}' not found. Use 'auto' for the default profile, or call /v1/models for available options.`) as any;
+    err.status = 400;
+    throw err;
+  }
+
+  const enabledModels = chain.filter(e => e.enabled);
+  if (enabledModels.length === 0) {
+    const err = new Error(`Profile '${suffix}' has no enabled models. Add models to this profile in the dashboard.`) as any;
+    err.status = 400;
+    throw err;
+  }
+
+  return { chain, strategyKey: `auto:${suffix}` };
+}
+
+export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireVision = false, requireTools = false, skipModels?: Set<number>, prefetchedChain?: ChainRow[]): RouteResult {
   const db = getDb();
 
   const strategy = getRoutingStrategy();
   if (strategy !== 'priority') refreshStatsCache(db);
 
-  // Get the enabled fallback chain joined with the fields the scorer needs.
-  const chain = db.prepare(`
-    SELECT fc.model_db_id, fc.priority, fc.enabled,
-           m.platform, m.model_id, m.display_name, m.intelligence_rank,
-           m.size_label, m.monthly_token_budget,
-           m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-           m.supports_tools, m.context_window
-    FROM fallback_config fc
-    JOIN models m ON m.id = fc.model_db_id AND m.enabled = 1
-    WHERE fc.enabled = 1
-  `).all() as ChainRow[];
+  const chain = prefetchedChain ?? getActiveChain(db).filter(e => e.enabled);
 
   const sortedChain = orderChain(chain, strategy);
 
-  // Sticky session: move preferred model to front of chain
+  // Sticky session / Explicit pinning: move preferred model to front of chain
   if (preferredModelDbId) {
     const idx = sortedChain.findIndex(e => e.model_db_id === preferredModelDbId);
-    if (idx > 0) {
-      const [preferred] = sortedChain.splice(idx, 1);
-      sortedChain.unshift(preferred);
+    if (idx >= 0) {
+      if (idx > 0) {
+        const [preferred] = sortedChain.splice(idx, 1);
+        sortedChain.unshift(preferred);
+      }
+    } else {
+      // The requested model is not in the current routing chain (e.g. it's a
+      // custom model or not added to the active profile). We must fulfill the
+      // explicit request by injecting it at the front.
+      const pinnedRow = db.prepare(`
+        SELECT m.id as model_db_id, 0 as priority, 1 as enabled,
+               m.platform, m.model_id, m.display_name, m.intelligence_rank,
+               m.size_label, m.monthly_token_budget,
+               m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
+               m.supports_tools, m.context_window, m.key_id
+        FROM models m
+        WHERE m.id = ? AND m.enabled = 1
+      `).get(preferredModelDbId) as ChainRow | undefined;
+      
+      if (pinnedRow) {
+        sortedChain.unshift(pinnedRow);
+      }
     }
   }
 
   for (const entry of sortedChain) {
+    // Models the caller has ruled out for this request — e.g. a 404
+    // "model removed upstream" already seen this request: trying the same
+    // model again on a different key would just burn another attempt on the
+    // same dead route (PR #111, credits @barbotkonv).
+    if (skipModels?.has(entry.model_db_id)) continue;
+
     // Vision requests skip text-only models — including a sticky/preferred one,
     // which is correct: don't pin an image turn to a model that can't see it.
     if (requireVision && !entry.supports_vision) continue;
@@ -396,9 +591,15 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     // gets the normal "all models exhausted" error rather than a wasted sweep.
     if (entry.context_window != null && estimatedTokens > entry.context_window) continue;
 
+    // Same guard for a model with a small per-minute token budget: a single
+    // request that alone exceeds tpm_limit can never fit one minute of quota and
+    // returns a guaranteed 413 (e.g. Groq gpt-oss-120b: 131k context but 8k TPM).
+    // estimatedTokens already includes reserved output, mirroring the check above.
+    if (entry.tpm_limit != null && estimatedTokens > entry.tpm_limit) continue;
+
     // Check if we have a provider for this platform
-    const provider = getProvider(entry.platform as any);
-    if (!provider) continue;
+    if (!hasProvider(entry.platform as Platform)) continue;
+    const provider = getProvider(entry.platform as Platform)!;
 
     // Get enabled keys that have not already failed validation or decryption.
     const keys = db.prepare(
@@ -422,6 +623,12 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     for (let attempt = 0; attempt < keys.length; attempt++) {
       const key = keys[idx % keys.length];
       idx++;
+
+      // A custom model belongs to exactly one endpoint: skip every custom key
+      // except the one it was registered with. Without this, multiple custom
+      // providers would round-robin each other's models onto the wrong
+      // endpoint. (#212) Legacy rows (key_id NULL) keep the old any-key match.
+      if (entry.platform === 'custom' && entry.key_id != null && key.id !== entry.key_id) continue;
 
       const skipId = `${entry.platform}:${entry.model_id}:${key.id}`;
       if (skipKeys?.has(skipId)) continue;
@@ -478,9 +685,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     // in the sortedChain for THIS specific request.
   }
 
-  const err = new Error('All models exhausted. Add more API keys or wait for rate limits to reset.') as any;
-  err.status = 429;
-  throw err;
+  throw new RouteError('All models exhausted. Add more API keys or wait for rate limits to reset.', 429);
 }
 
 /**
@@ -503,7 +708,7 @@ export interface RoutingScore {
   totalRequests: number; // decay-weighted observations
 }
 
-export function getRoutingScores(): { strategy: RoutingStrategy; weights: RoutingWeights | null; scores: RoutingScore[] } {
+export function getRoutingScores(): { strategy: RoutingStrategy; weights: RoutingWeights | null; customWeights: RoutingWeights; scores: RoutingScore[] } {
   const db = getDb();
   const strategy = getRoutingStrategy();
   refreshStatsCache(db);
@@ -545,7 +750,11 @@ export function getRoutingScores(): { strategy: RoutingStrategy; weights: Routin
     };
   }).sort((a, b) => b.score - a.score);
 
-  return { strategy, weights: weightsFor(strategy), scores };
+  // customWeights is always present (the saved vector, or the balanced default)
+  // so the dashboard's custom-weight sliders can render even before the user
+  // has saved their own — distinct from `weights`, which is null in priority
+  // mode and the active preset otherwise.
+  return { strategy, weights: weightsFor(strategy), customWeights: getCustomWeights(), scores };
 }
 
 // Whether at least one vision-capable model is enabled in the fallback chain.

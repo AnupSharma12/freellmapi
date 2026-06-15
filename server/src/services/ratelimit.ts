@@ -301,6 +301,21 @@ export function getNextCooldownDuration(platform: string, modelId: string, keyId
 // Short cooldown for a transient (per-minute) 429 — recovers within ~one window.
 const TRANSIENT_COOLDOWN_MS = 90 * 1000;
 
+// Long cooldown for a 402 Payment Required (provider/key out of credits). Unlike
+// a 429, this won't clear on the next minute/day window — it needs a top-up or
+// billing reset. Bench the model+key for a full day so the router fails over to
+// other providers instead of re-hammering a dead key every retry. Re-escalates
+// on the next 402 after expiry if still unpaid; a restart re-benches on first hit.
+export const PAYMENT_REQUIRED_COOLDOWN_MS = DAY;
+
+// Long cooldown for a 403 Forbidden on a key that already passed validateKey
+// (so it is not a dead key — the health checker disables those). A request-time
+// 403 means this key's tier can't reach this specific model (e.g. gpt-4o on
+// GitHub Models' free tier, subscription-only models on Cloudflare). That won't
+// change within a minute window, so bench this model+key for a full day and let
+// the router fail over to a model the key can actually serve. See issue #256.
+export const MODEL_FORBIDDEN_COOLDOWN_MS = DAY;
+
 // Decide how long to bench a model+key after an upstream 429. Escalate to the
 // long quarantine (getNextCooldownDuration, up to 24h) ONLY when the model is
 // genuinely at its DAILY limit (RPD or TPD) — that won't recover until the
@@ -319,16 +334,21 @@ export function getCooldownDurationForLimit(
   modelId: string,
   keyId: number,
   limits: { rpd: number | null; tpd: number | null },
+  retryAfterMs?: number | null,
 ): number {
   const now = Date.now();
   const rpdExhausted =
     limits.rpd !== null && requestCount(platform, modelId, keyId, DAY, now) >= limits.rpd;
   const tpdExhausted =
     limits.tpd !== null && tokenCount(platform, modelId, keyId, DAY, now) >= limits.tpd;
-  if (rpdExhausted || tpdExhausted) {
-    return getNextCooldownDuration(platform, modelId, keyId);
-  }
-  return TRANSIENT_COOLDOWN_MS;
+  const base = (rpdExhausted || tpdExhausted)
+    ? getNextCooldownDuration(platform, modelId, keyId)
+    : TRANSIENT_COOLDOWN_MS;
+  // Honor an upstream Retry-After as a floor: never bench shorter than our own
+  // heuristic, but extend (capped at a day) when the provider explicitly asks
+  // to wait longer than we otherwise would.
+  if (retryAfterMs != null && retryAfterMs > base) return Math.min(retryAfterMs, DAY);
+  return base;
 }
 
 function persistedCooldownExpiry(
